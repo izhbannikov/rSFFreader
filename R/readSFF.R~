@@ -91,7 +91,7 @@ writeSff <- function(sffobj, filename){
   #print(number_of_reads)     
   #index_length=sffobj@header[[1]]$index_length
   
-  ans <- .Call("write_sff",filename, sffobj@header[[1]]$magic_number,
+  ans <- .Call("write_sff",filenames, sffobj@header[[1]]$magic_number,
                                       sffobj@header[[1]]$version,
                                       sffobj@header[[1]]$index_offset,
                                       sffobj@header[[1]]$index_length,

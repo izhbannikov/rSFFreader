@@ -17,6 +17,7 @@ extern "C" {
 #include <stdlib.h>        // malloc(), free()
 #include <arpa/inet.h>  // htons(), htonl()
 
+
 //#include "encode.h"
 #include "IRanges_interface.h"
 #include "Biostrings_interface.h"
@@ -25,44 +26,14 @@ extern "C" {
 static int debug = 0;
 static int flowgram_bytes_per_flow = 2;
 
-/***************************** SFF file structures *****************************/
-typedef struct CommonHeader {
-    uint32_t magic_number;
-    char version[4];
-    uint64_t index_offset;
-    uint32_t index_length;
-    uint32_t number_of_reads;
-    uint16_t commonHeader_length;
-    uint16_t key_length;
-    uint16_t number_of_flows_per_read;
-    uint8_t flowgram_format_code;
-    char *flow_chars;// flow_chars omitted
-    char *key_sequence;// key_sequence omitted
-    // eight_byte_padding is not necessary
-} COMMONheader;
+long sff_file_size = 0;
+long manifest_size = 0;
 
-typedef struct ReadHeader {
-    uint16_t read_header_length;
-    uint16_t name_length;
-    uint32_t number_of_bases;
-    uint16_t clip_qual_left;
-    uint16_t clip_qual_right;
-    uint16_t clip_adapter_left;
-    uint16_t clip_adapter_right;
-    // name
-    // eight_byte_padding
-} READheader;
-
-typedef struct ReadData {
-    double* flows;
-    int*   index;
-    char*  name;
-    char*  quality;
-    char*  bases;
-} READdata;
 
 /***************************** Auxilary Functions *****************************/
 
+
+// only version 1 is supported
 int
 isMagicNumberCorrect(uint32_t magic_number)
 {
@@ -78,6 +49,7 @@ isVersionInfoCorrect(char* version)
                 return 1;
         else return 0;
 }
+
 
 
 static void
@@ -184,6 +156,7 @@ BE64toNA(uint64_t bigEndian)
     }
 }
 
+
 int
 commonHeaderPaddingSize(int number_of_flows_per_read, int key_length)
 {
@@ -254,6 +227,8 @@ readCommonHeader(const char *fname){
     if(file==NULL)
         Rf_error("cannot open specified file: '%s'", fname);
 
+    get_sff_file_size( file );
+    
     /** Read Common Header Section **/
     int size = fread( &commonHeader.magic_number, sizeof(uint32_t), 1, file);
     commonHeader.magic_number = htonl(commonHeader.magic_number);
@@ -304,7 +279,9 @@ readCommonHeader(const char *fname){
         commonHeader.key_sequence[i] = ch;
     }
     commonHeader.key_sequence[i] = '\0';
-
+    
+    commonHeader.manifest = readOneSFFManifest (file, commonHeader.index_offset);
+    
     fclose(file);
 
     // if debug, print out header info
@@ -335,13 +312,13 @@ readOneSFFHeader (SEXP file)
 {
     // we want to call readCommonHeader and convert to SEXP
     COMMONheader commonHeader = readCommonHeader(CHAR(file));
-    SEXP headerList = allocVector(VECSXP, 12);
+    SEXP headerList = allocVector(VECSXP, 13);
     SEXP eltnm;
     static const char *eltnames[] = {
         "filename", "magic_number", "version", "index_offset",
         "index_length", "number_of_reads", "header_length",
         "key_length", "number_of_flows_per_read", "flowgram_format_code", "flow_chars",
-        "key_sequence"
+        "key_sequence","manifest"
     };
     PROTECT(headerList);
     SET_VECTOR_ELT(headerList, 0, mkString(CHAR(file)));
@@ -357,9 +334,10 @@ readOneSFFHeader (SEXP file)
     SET_VECTOR_ELT(headerList, 9, Rf_ScalarInteger(commonHeader.flowgram_format_code));
     SET_VECTOR_ELT(headerList, 10, mkString(commonHeader.flow_chars));
     SET_VECTOR_ELT(headerList, 11, mkString(commonHeader.key_sequence));
+    SET_VECTOR_ELT(headerList, 12, commonHeader.manifest);
 
-    PROTECT( eltnm = allocVector( STRSXP, 12 ) );
-    for( int i = 0; i < 12; i++ )
+    PROTECT( eltnm = allocVector( STRSXP, 13 ) );
+    for( int i = 0; i < 13; i++ )
         SET_STRING_ELT( eltnm, i, mkChar( eltnames[i] ) );
     namesgets( headerList, eltnm );
     UNPROTECT(1);
@@ -392,6 +370,7 @@ read_sff_header(SEXP files, SEXP verbose)
         SET_VECTOR_ELT(ans,i,readOneSFFHeader(fname));
     }
     UNPROTECT(1);
+    
     return ans;
 }
 
@@ -470,6 +449,7 @@ typedef struct sff_loader_ext {
     int lkup_length_seq;
     const int *lkup_qual;
     int lkup_length_qual;
+    int *read_header_lengths;
 } SFF_loaderExt;
 
 static void SFF_load_seqid(SFFloader *loader,
@@ -624,6 +604,9 @@ static SFF_loaderExt new_SFF_loaderExt(SEXP seq, SEXP qual, SEXP lkup_seq, SEXP 
         loader_ext.lkup_qual = INTEGER(lkup_qual);
         loader_ext.lkup_length_qual = LENGTH(lkup_qual);
     }
+    
+    loader_ext.read_header_lengths = (int *) R_alloc((long) get_XVectorList_length(seq), sizeof(int));
+    
     return loader_ext;
 }
 
@@ -650,7 +633,7 @@ static SFFloader new_SFF_loader(int load_seqids, int load_flowgrams,
  * Return:        SEXP string - file path
  */
 static void
-readSFF(SEXP string, int *recno, SFFloader *loader)
+readSFF( SEXP string, int *recno, SFFloader *loader )
 {
     // C Structures
     COMMONheader commonHeader;
@@ -670,7 +653,9 @@ readSFF(SEXP string, int *recno, SFFloader *loader)
     FILE* file = fopen (string2, "r");
     if(file==NULL)
         Rf_error("cannot open specified file: '%s'", string2);
-
+    
+    
+    
     commonHeader = readCommonHeader(string2);
     // add fseek statement to bypass the commonHeader
     fseek(file, commonHeader.commonHeader_length , SEEK_SET);
@@ -679,6 +664,7 @@ readSFF(SEXP string, int *recno, SFFloader *loader)
 
     // for every read,
     for(int read=0; read<commonHeader.number_of_reads; read++) {
+        
         // Read Header Section
         fres = fread( &header.read_header_length, sizeof(uint16_t), 1, file);
         header.read_header_length = htons(header.read_header_length);
@@ -790,10 +776,16 @@ readSFF(SEXP string, int *recno, SFFloader *loader)
         (*recno)++;
     } // end of for(every read)
 
+    //(*sffmanifest) = readOneSFFManifest(file);
+    
     freeCommonHeader(commonHeader);
+    
+    
+    
     fclose(file);
     return;
 }
+
 SEXP
 sff_geometry(SEXP files)
 {
@@ -834,7 +826,8 @@ sff_geometry(SEXP files)
         FILE* file = fopen (fname, "r");
         if(file==NULL)
             Rf_error("cannot open specified file: '%s'", fname);
-
+        
+        
         commonHeader = readCommonHeader(fname);
         // add fseek statement to bypass the commonHeader
         fseek(file, commonHeader.commonHeader_length , SEEK_SET);
@@ -898,12 +891,13 @@ read_sff(SEXP files, SEXP use_names, SEXP use_flows, SEXP lkup_seq, SEXP lkup_qu
 	  SEXP qclip_start, qclip_width, aclip_start, aclip_width;
     SFF_loaderExt loader_ext;
     SFFloader loader;
+    
 
     if (!IS_CHARACTER(files))
         Rf_error("'%s' must be '%s'", "files", "character");
 
     nfiles = LENGTH(files);
-
+    
     load_seqids = LOGICAL(use_names)[0];
     load_flowgrams = LOGICAL(use_flows)[0];
     set_verbose = LOGICAL(verbose)[0];
@@ -935,18 +929,24 @@ read_sff(SEXP files, SEXP use_names, SEXP use_flows, SEXP lkup_seq, SEXP lkup_qu
  
     loader_ext = new_SFF_loaderExt(reads, quals, lkup_seq,lkup_qual, nbases, flowgram_maxwidth); //Biostrings/XStringSet_io.c
     loader = new_SFF_loader(load_seqids, load_flowgrams, &loader_ext); //Biostrings/XStringSet_io.c
-
+    
+    
     recno = 0;
-
-    for (i = 0; i < nfiles; i++) {
+    
+    //SEXP sffmanifest_array;
+    //PROTECT(sffmanifest_array = allocVector(VECSXP,nfiles));
+    for (i = 0; i < nfiles; i++) 
+    {
+        //SEXP sffmanifest;
         R_CheckUserInterrupt();
         fname = STRING_ELT(files, i);
         if(set_verbose) {
             Rprintf("reading file:%s\n", CHAR(fname));
         }
         readSFF(fname,&recno, &loader);
+        //SET_VECTOR_ELT(sffmanifest_array,i,sffmanifest);
     }
-
+    
     // load in the seq_ids
     if (load_seqids) {
         PROTECT(ans_names =
@@ -971,12 +971,13 @@ read_sff(SEXP files, SEXP use_names, SEXP use_flows, SEXP lkup_seq, SEXP lkup_qu
 	PROTECT(adapt_clip = new_IRanges("IRanges", aclip_start, aclip_width, R_NilValue));
   
   if (load_flowgrams) {
-  PROTECT(flowgrams = allocVector(REALSXP, ans_length*flowgram_maxwidth));
-  PROTECT(flow_indices = NEW_INTEGER(nbases));
-  memcpy(REAL(flowgrams), loader_ext.flowgrams.flows, sizeof(double)* (ans_length*flowgram_maxwidth));
-  memcpy(INTEGER(flow_indices), loader_ext.flowgrams.indices, sizeof(int) * nbases);
+    PROTECT(flowgrams = allocVector(REALSXP, ans_length*flowgram_maxwidth));
+    PROTECT(flow_indices = NEW_INTEGER(nbases));
+    memcpy(REAL(flowgrams), loader_ext.flowgrams.flows, sizeof(double)* (ans_length*flowgram_maxwidth));
+    memcpy(INTEGER(flow_indices), loader_ext.flowgrams.indices, sizeof(int) * nbases);
   }
-
+  
+  
     PROTECT(ans = NEW_LIST(7));
     SET_VECTOR_ELT(ans, 0, header);
     SET_VECTOR_ELT(ans, 1, reads); /* read */
@@ -985,7 +986,9 @@ read_sff(SEXP files, SEXP use_names, SEXP use_flows, SEXP lkup_seq, SEXP lkup_qu
     SET_VECTOR_ELT(ans, 4, adapt_clip); /* adapter based clip points */
     SET_VECTOR_ELT(ans, 5, flowgrams); /* flowgrams */
     SET_VECTOR_ELT(ans, 6, flow_indices); /* flow indices across reads */
+    //SET_VECTOR_ELT(ans, 7, sffmanifest_array);
     UNPROTECT(11);
+    
     if (load_flowgrams) {
       UNPROTECT(2);
     }
@@ -998,6 +1001,7 @@ read_sff(SEXP files, SEXP use_names, SEXP use_flows, SEXP lkup_seq, SEXP lkup_qu
     SET_STRING_ELT(nms, 4, mkChar("adapterClip"));
     SET_STRING_ELT(nms, 5, mkChar("flowgrams"));
     SET_STRING_ELT(nms, 6, mkChar("flowIndices"));
+    //SET_STRING_ELT(nms, 7, mkChar("manifest"));
     setAttrib(ans, R_NamesSymbol, nms);
 	UNPROTECT(1);
 
@@ -1057,31 +1061,478 @@ write_phred_quality(SEXP id, SEXP quality,
     char *idbuf = (char *) R_alloc(sizeof(char), width + 1),
         *qualbuf = (char *) R_alloc(sizeof(char), width + 1);
     int i, j, phredval;
-    for (i = 0; i < len; ++i) {
+    
+    for (i = 0; i < len; ++i) 
+    {
         idbuf = _cache_to_char(&xid, i, idbuf, width);
-        if (idbuf == NULL){
-			fclose(fout);
-			Rf_error("failed to write record %d", i + 1);
-		}
-		fprintf(fout, ">%s\n",idbuf);
+        if (idbuf == NULL)
+        {
+			      fclose(fout);
+			      Rf_error("failed to write record %d", i + 1);
+		    }
+		    fprintf(fout, ">%s\n",idbuf);
         
         qualbuf = _cache_to_char(&xquality, i, qualbuf, width);
-        if (qualbuf == NULL){
-			fclose(fout);
-			Rf_error("failed to write record %d", i + 1);
-		}
-		j = 0;
-        while(qualbuf[j] != '\0') {
-			if (j != 0) fprintf(fout," ");
-            phredval = CharToPhred(qualbuf[j]);
+        if (qualbuf == NULL)
+        {
+			    fclose(fout);
+			    Rf_error("failed to write record %d", i + 1);
+		    }
+		    j = 0;
+        while(qualbuf[j] != '\0') 
+        {
+			    if (j != 0) fprintf(fout," ");
+              phredval = CharToPhred(qualbuf[j]);
 	        fprintf(fout, "%i", phredval);
-			j++;
+			    j++;
         }
-		fprintf(fout,"\n");
+		    fprintf(fout,"\n");
     }
+    
     fclose(fout);
     return R_NilValue;
 }
+
+//===================Write sff functions================
+SEXP write_sff(SEXP filename,
+                SEXP magic, 
+                SEXP version,
+                SEXP index_offset,
+                SEXP index_len,
+                SEXP number_of_reads,
+                SEXP header_len,
+                SEXP key_len,
+                SEXP flow_len,
+                SEXP flowgram_format,
+                SEXP flow,
+                SEXP key,
+                SEXP sread, 
+                SEXP quality, 
+                SEXP flowIndices, 
+                SEXP flowgrams,
+                SEXP names,
+                SEXP qualityClip,
+                SEXP adapterClip,
+                SEXP manifest)
+{
+  //printf("%s\n",CHAR(STRING_ELT(filename,0)));
+  /*printf("%d\n",INTEGER(magic)[0]);
+  printf("%s\n",CHAR(STRING_ELT(version,0)));
+  printf("%d\n",INTEGER(index_offset)[0]);
+  printf("%d\n",INTEGER(index_len)[0]);
+  printf("%d\n",INTEGER(number_of_reads)[0]);
+  printf("%d\n",INTEGER(header_len)[0]);
+  printf("%d\n",INTEGER(key_len)[0]);
+  printf("%d\n",INTEGER(flow_len)[0]);
+  printf("%d\n",INTEGER(flowgram_format)[0]);
+  printf("%s\n",CHAR(STRING_ELT(flow,0)));
+  printf("%s\n",CHAR(STRING_ELT(key,0)));
+  */
+  
+  if (!(IS_S4_OBJECT(sread) && 
+          strcmp(get_classname(sread), "DNAStringSet") == 0))
+        Rf_error("'%s' must be '%s'", "sread", "DNAStringSet");
+  
+  if (!(IS_S4_OBJECT(quality) && 
+          strcmp(get_classname(quality), "BStringSet") == 0)) // //BStringSet
+        Rf_error("'%s' must be '%s'", "quality", "BStringSet");
+  
+  
+  const int len = get_XStringSet_length(sread);
+  
+  
+  if ((len != get_XStringSet_length(quality)))
+  {
+        Rf_error("length() of %s must all be equal",
+                 "'sread', 'quality'");
+  } 
+  
+  cachedXStringSet xsread = cache_XStringSet(sread);
+  cachedXStringSet xquality = cache_XStringSet(quality);
+  int width = 2048;
+  char *sreadbuf = (char *) R_alloc(sizeof(char), width + 1);
+  char *qualbuf = (char *) R_alloc(sizeof(char), width + 1);
+  cachedCharSeq seq_i, qual_i;
+  
+  //Clip points
+  cachedIRanges iqualityClip = cache_IRanges(qualityClip);
+  cachedIRanges iadapterClip = cache_IRanges(adapterClip);
+  int qualityClip_i_start, qualityClip_i_end, adapterClip_i_start, adapterClip_i_end ;
+  
+  //Common header
+  FILE *fp = fopen( CHAR(STRING_ELT(filename,0)), "w");
+  
+  COMMONheader commonHeader;
+  commonHeader.magic_number = INTEGER(magic)[0];
+  //commonHeader.index_offset = INTEGER(index_offset)[0];
+  commonHeader.index_length = INTEGER(index_len)[0];
+  commonHeader.number_of_reads = INTEGER(number_of_reads)[0];
+  commonHeader.commonHeader_length = INTEGER(header_len)[0];
+  commonHeader.key_length = INTEGER(key_len)[0];
+  commonHeader.number_of_flows_per_read = INTEGER(flow_len)[0];
+  commonHeader.flowgram_format_code = INTEGER(flowgram_format)[0];
+ 
+  commonHeader.flow_chars = (char*) malloc(sizeof(char)*(commonHeader.number_of_flows_per_read+1));
+  if (commonHeader.flow_chars==NULL) Rf_error("cannot allocate memory");
+ 
+  int i;
+  for(i=0; i<commonHeader.number_of_flows_per_read; i++) 
+  {
+    commonHeader.flow_chars[i] = CHAR(STRING_ELT(flow,0))[i];
+  }
+  commonHeader.flow_chars[i] = '\0';
+  // key sequence
+  // malloc must be freed before the function ends
+  commonHeader.key_sequence = (char*) malloc(sizeof(char)*(commonHeader.key_length+1));
+  if (commonHeader.key_sequence==NULL) Rf_error("cannot allocate memory");
+  for(i=0; i<commonHeader.key_length; i++) 
+  {
+    commonHeader.key_sequence[i] = CHAR(STRING_ELT(key,0))[i];
+  }
+  commonHeader.key_sequence[i] = '\0';
+
+  //write_sff_common_header(fp, &commonHeader);
+  int header_size = sizeof(commonHeader.magic_number)
+                  + sizeof(char)*4 //for version
+                  + sizeof(commonHeader.index_offset) 
+                  + sizeof(commonHeader.index_length) 
+                  + sizeof(commonHeader.number_of_reads) 
+                  + sizeof(commonHeader.commonHeader_length) 
+                  + sizeof(commonHeader.key_length)  
+                  + sizeof(commonHeader.number_of_flows_per_read) 
+                  + sizeof(commonHeader.flowgram_format_code)
+                  + (sizeof(char) * commonHeader.number_of_flows_per_read )
+                  + (sizeof(char) * commonHeader.key_length ) ;
+    
+    if ( !(header_size % PADDING_SIZE == 0) ) {
+        header_size += PADDING_SIZE - (header_size % PADDING_SIZE);
+    }
+  //printf("%d\n",header_size);
+  fseek(fp,header_size,SEEK_SET);
+  //double *flows = (double*)malloc(sizeof(double)*INTEGER(flow_len)[0]*len);
+  
+  //flows = REAL(VECTOR_ELT(flowgrams,0));
+  
+  int index = 0;
+  for(int ii=0; ii<len; ++ii)
+  {
+    // extract XString i from the XStringSet
+    seq_i = get_cachedXStringSet_elt(&xsread, ii);
+    qual_i = get_cachedXStringSet_elt(&xquality, ii);
+    
+    //Extract clip points
+    qualityClip_i_start = get_cachedIRanges_elt_start(&iqualityClip, ii);
+    qualityClip_i_end = get_cachedIRanges_elt_end(&iqualityClip, ii);
+    adapterClip_i_start = get_cachedIRanges_elt_start(&iadapterClip, ii);
+    adapterClip_i_end = get_cachedIRanges_elt_end(&iadapterClip, ii);
+    
+    READheader readHeader;
+    readHeader.number_of_bases = seq_i.length;
+    readHeader.clip_qual_left = qualityClip_i_start;
+    readHeader.clip_qual_right = qualityClip_i_end;
+    readHeader.clip_adapter_left = adapterClip_i_start;
+    readHeader.clip_adapter_right = adapterClip_i_end;
+    readHeader.name = CHAR(STRING_ELT(names,ii));
+    readHeader.name_length = strlen(readHeader.name);
+    
+    readHeader.read_header_length = sizeof(readHeader.name_length)
+                                    + sizeof(readHeader.number_of_bases)
+                                    + sizeof(readHeader.clip_qual_left)
+                                    + sizeof(readHeader.clip_qual_right)
+                                    + sizeof(readHeader.clip_adapter_left)
+                                    + sizeof(readHeader.clip_adapter_right)
+                                    + (sizeof(char) * readHeader.name_length);
+    
+    
+    
+    if ( !( readHeader.read_header_length % 8 == 0) )
+    {
+      int remainder = 8 - (readHeader.read_header_length % 8);
+      for(int i=0; i< remainder; ++i)
+        readHeader.read_header_length += 1;
+    }
+    
+    int nbases = readHeader.number_of_bases;
+    int nlen = readHeader.name_length;
+    
+    write_sff_read_header(fp, &readHeader );
+    
+    //Read data
+    READdata readData;
+    
+    int j;
+    
+    readData.flows = (double*)malloc( sizeof(double)*(INTEGER(flow_len)[0]) );
+    for (j = 0; j < INTEGER(flow_len)[0]; ++j)
+      readData.flows[j] = REAL(VECTOR_ELT(flowgrams,ii))[j];//flows[index+j];
+    
+    index += INTEGER(flow_len)[0];
+    //printf("!\n");
+    readData.index = (int*)malloc( sizeof(int)*(seq_i.length) );
+    for (j = 0; j < seq_i.length; j++)
+      readData.index[j] = INTEGER(VECTOR_ELT(flowIndices,ii))[j];//readData.indices[j] = (uint8_t)INTEGER(VECTOR_ELT(flowIndices,ii))[j];
+    //printf("!\n");
+    readData.quality = (char*)malloc( sizeof(char)*(qual_i.length+1) );
+    for (j = 0; j < qual_i.length; j++)
+      readData.quality[j] = qual_i.seq[j];
+    readData.quality[j] = '\0';
+    
+    readData.bases = (char*)malloc( sizeof(char)*(seq_i.length+1) );
+    for (j = 0; j < seq_i.length; j++)
+      readData.bases[j] = DNAdecode(seq_i.seq[j]);
+    readData.bases[j] = '\0';
+    
+    
+    write_sff_read_data(fp, INTEGER(flow_len)[0], nbases, &readData, nlen);
+    
+    //commonHeader.index_offset = INTEGER(index_offset)[0];
+        
+    free(readData.bases);
+    free(readData.quality);
+    free(readData.flows);
+    free(readData.index);
+  }
+  
+  int msize = LENGTH( VECTOR_ELT(manifest,0) );
+  
+  char *mdata = (char*)malloc(sizeof(char)*msize);
+  for (int i = 0; i < msize; i++) {
+      mdata[i] = (char) RAW(VECTOR_ELT(manifest,0))[i];
+  }
+  
+  commonHeader.index_offset = ftell(fp);//be64toh( ftell(fp) );
+  //printf("%d\n",commonHeader.index_offset);
+  write_manifest(fp, mdata, msize);
+  fseek(fp, 0, SEEK_SET); // seek back to beginning of file
+  write_sff_common_header(fp, &commonHeader);
+  
+  fclose(fp);
+  
+  free(mdata);
+  free(commonHeader.flow_chars);
+  free(commonHeader.key_sequence);
+  
+  return R_NilValue;
+    
+}
+
+void write_sff_common_header(FILE *fp, COMMONheader *ch)
+{
+    char v[4] = {0x00,0x00,0x00,0x01};
+    uint32_t mnum = ntohl(ch->magic_number);//be32toh(ch->magic_number);
+    uint64_t ind_off = htonll(ch->index_offset);//be64toh(ch->index_offset);
+    uint32_t ind_len = ntohl(ch->index_length);//be32toh(ch->index_length);
+    uint32_t num_reads = ntohl(ch->number_of_reads);//be32toh(ch->number_of_reads);
+    uint16_t head_len = ntohs(ch->commonHeader_length);//be16toh(ch->commonHeader_length);
+    uint16_t k_len = ntohs(ch->key_length);//be16toh(ch->key_length);
+    uint16_t f_len = ntohs(ch->number_of_flows_per_read);//be16toh(ch->number_of_flows_per_read);
+    uint8_t f_frmt = 0x01;
+    
+    fwrite(&mnum, sizeof(uint32_t), 1, fp);
+    fwrite(&v, sizeof(char) , 4, fp);
+    fwrite(&ind_off, sizeof(uint64_t), 1, fp);
+    fwrite(&ind_len, sizeof(uint32_t), 1, fp);
+    fwrite(&num_reads, sizeof(uint32_t), 1, fp);
+    fwrite(&head_len, sizeof(uint16_t), 1, fp);
+    fwrite(&k_len, sizeof(uint16_t), 1, fp);
+    fwrite(&f_len, sizeof(uint16_t), 1, fp);
+    fwrite(&f_frmt, sizeof(uint8_t) , 1, fp);
+    fwrite(ch->flow_chars, sizeof(char), ch->number_of_flows_per_read, fp);
+    fwrite(ch->key_sequence, sizeof(char) , ch->key_length, fp);
+    
+    int header_size = sizeof(ch->magic_number)
+                + sizeof(v)
+                + sizeof(ch->index_offset)
+                + sizeof(ch->index_length)
+                + sizeof(ch->number_of_reads)
+                + sizeof( ch->commonHeader_length )
+                + sizeof(ch->key_length)
+                + sizeof(ch->number_of_flows_per_read)
+                + sizeof(ch->flowgram_format_code)
+                + (sizeof(char) * ch->number_of_flows_per_read )
+                + (sizeof(char) * ch->key_length );
+
+    if ( !(header_size % PADDING_SIZE == 0) )
+    {
+      write_padding(fp, header_size); //printf("%d\n",PADDING_SIZE - (header_size % PADDING_SIZE));
+    }
+}
+
+void write_sff_read_header(FILE *fp, READheader *rh) {
+   rh->read_header_length=ntohs(rh->read_header_length);//be16toh(rh->read_header_length);
+   rh->name_length= ntohs(rh->name_length); //be16toh(rh->name_length);
+   rh->number_of_bases=ntohl(rh->number_of_bases);//be32toh(rh->number_of_bases);
+   rh->clip_qual_left= ntohs(rh->clip_qual_left);//be16toh(rh->clip_qual_left);
+   rh->clip_qual_right= ntohs(rh->clip_qual_right);//be16toh(rh->clip_qual_right);
+   rh->clip_adapter_left= ntohs(rh->clip_adapter_left);//be16toh(rh->clip_adapter_left);
+   rh->clip_adapter_right= ntohs(rh->clip_adapter_right);//be16toh(rh->clip_adapter_right);
+   
+   fwrite(&(rh->read_header_length) , sizeof(uint16_t), 1, fp);
+   fwrite(&(rh->name_length) , sizeof(uint16_t), 1, fp);
+   fwrite(&(rh->number_of_bases) , sizeof(uint32_t), 1, fp);
+   fwrite(&(rh->clip_qual_left) , sizeof(uint16_t), 1, fp);
+   fwrite(&(rh->clip_qual_right) , sizeof(uint16_t), 1, fp);
+   fwrite(&(rh->clip_adapter_left) , sizeof(uint16_t), 1, fp);
+   fwrite(&(rh->clip_adapter_right) , sizeof(uint16_t), 1, fp);
+   //fwrite(rh->name , sizeof(char), htobe16(rh->name_length), fp);
+   fwrite(rh->name , sizeof(char), htons(rh->name_length), fp);
+   /*
+   int header_size = sizeof(htobe16((*rh).read_header_length))
+                  + sizeof(htobe16((*rh).name_length))
+                  + sizeof(htobe32((*rh).number_of_bases))
+                  + sizeof(htobe16((*rh).clip_qual_left))
+                  + sizeof(htobe16((*rh).clip_qual_right))
+                  + sizeof(htobe16((*rh).clip_adapter_left))
+                  + sizeof(htobe16((*rh).clip_adapter_right))
+                  + (sizeof(char) * htobe16((*rh).name_length));
+   */
+   int header_size = sizeof((*rh).read_header_length)
+                  + sizeof((*rh).name_length)
+                  + sizeof((*rh).number_of_bases)
+                  + sizeof((*rh).clip_qual_left)
+                  + sizeof((*rh).clip_qual_right)
+                  + sizeof((*rh).clip_adapter_left)
+                  + sizeof((*rh).clip_adapter_right)
+                  + (sizeof(char) * htons((*rh).name_length));
+   
+   if ( !(header_size % PADDING_SIZE == 0) ) {
+        write_padding(fp, header_size); 
+   }
+    
+}
+
+void write_sff_read_data(FILE *fp, int nflows, int nbases, READdata *rd, int name_len)
+{
+    uint16_t *flowgram;
+    uint8_t *flow_index;
+    
+    /* sff files are in big endian notation so adjust appropriately */
+    /* allocate the appropriate arrays */
+    flowgram   = (uint16_t *) malloc( nflows * sizeof(uint16_t) );
+    if (!flowgram) {
+        fprintf(stderr,
+                "Out of memory! Could not allocate for a read flowgram!\n");
+        exit(1);
+    }
+    
+    for (int i = 0; i < nflows; i++) {
+       //flowgram[i] = be16toh(rd->flows[i]*100.0);
+       flowgram[i] = ntohs(rd->flows[i]*100.0);
+    }
+    
+    flow_index = (uint8_t *) malloc( nbases * sizeof(uint8_t)  );
+    if (!flow_index) {
+        fprintf(stderr,
+                "Out of memory! Could not allocate for a read flow index!\n");
+        exit(1);
+    }
+    
+    flow_index[0] = rd->index[0];
+    for(int i=1; i<nbases; i++) 
+    {
+        flow_index[i] =  (uint8_t)(rd->index[i] - rd->index[i-1])  ;
+    }
+    
+    for(int i=0; i<nbases; i++)
+    {
+      rd->quality[i] = CharToPhred(rd->quality[i]);
+    }
+    
+    fwrite(flowgram, sizeof(uint16_t), (size_t) nflows, fp);
+    fwrite(flow_index, sizeof(uint8_t), (size_t) nbases, fp);
+    fwrite(rd->bases, sizeof(char), (size_t) nbases, fp);
+    fwrite(rd->quality, sizeof(uint8_t), (size_t) nbases, fp);
+    //
+    //the section should be a multiple of 8-bytes, if not,
+    // it is zero-byte padded to make it so
+
+    int data_size = (sizeof(uint16_t) * nflows) // flowgram size
+                + (sizeof(uint8_t) * nbases) // flow_index size
+                + (sizeof(char) * nbases) // bases size
+                + (sizeof(char) * nbases); // quality size
+                  
+    if ( !(data_size % PADDING_SIZE == 0) )
+    {
+        write_padding(fp, data_size);
+    }
+}
+
+
+void write_padding(FILE *fp, int header_size)
+{
+    int remainder = PADDING_SIZE - (header_size % PADDING_SIZE);
+    uint8_t padding[remainder];
+    int i;
+    for(i=0; i< remainder; ++i)
+      padding[i] = 0;
+    
+    
+    fwrite(padding, sizeof(uint8_t), remainder, fp);
+}
+
+
+SEXP readOneSFFManifest (FILE *fp, long index_offset)
+{
+    long cur_pos = ftell(fp); // get current file pointer
+    
+    fseek ( fp, index_offset, SEEK_SET );
+    
+    long manifest_size = sff_file_size - index_offset;//ftell( fp );
+    //printf("%d !!!\n",manifest_size);
+    char* manifest_data = (char*)malloc( manifest_size * sizeof(char) );
+    if (!manifest_data)
+    {
+        fprintf(stderr,
+                "Out of memory! Could not allocate header flow string!\n");
+        exit(1);
+    }
+    
+    int fres = fread(manifest_data, sizeof(char), manifest_size, fp);
+    
+    SEXP mdata = allocVector(RAWSXP, manifest_size);
+    memcpy(RAW(mdata), manifest_data, manifest_size);
+    
+    fseek(fp, cur_pos, SEEK_SET); //seek bac
+    
+    free(manifest_data);
+    
+    return mdata;
+}
+
+
+void write_manifest(FILE *fp, char *manifest, int msize)
+{
+  fwrite(manifest, sizeof(char), msize, fp);
+}
+
+void get_sff_file_size(FILE *fp)
+{
+  fseek(fp, 0, SEEK_END); // seek to end of file
+  sff_file_size = ftell(fp); // get current file pointer
+  fseek(fp, 0, SEEK_SET); // seek back to beginning of file
+// proceed with allocating memory and reading the file
+}
+
+unsigned long long htonll(unsigned long long src) { 
+  static int typ = TYP_INIT; 
+  unsigned char c; 
+  union { 
+    unsigned long long ull; 
+    unsigned char c[8]; 
+  } x; 
+  if (typ == TYP_INIT) { 
+    x.ull = 0x01; 
+    typ = (x.c[7] == 0x01ULL) ? TYP_BIGE : TYP_SMLE; 
+  } 
+  if (typ == TYP_BIGE) 
+    return src; 
+  x.ull = src; 
+  c = x.c[0]; x.c[0] = x.c[7]; x.c[7] = c; 
+  c = x.c[1]; x.c[1] = x.c[6]; x.c[6] = c; 
+  c = x.c[2]; x.c[2] = x.c[5]; x.c[5] = c; 
+  c = x.c[3]; x.c[3] = x.c[4]; x.c[4] = c; 
+  return x.ull; 
+} 
 
 
 #ifdef __cplusplus

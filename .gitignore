@@ -1,9 +1,0 @@
-*.o
-*.so
-.Rproj.user
-.DS_Store
-.Rbuildignore
-.RData
-.Rhistory
-.gitignore
-*.Rproj
